@@ -751,7 +751,13 @@ def analyze_dataset(df):
         insights = generate_insights(
             df,
             context_result,
-            issues
+            issues,
+            {
+                "anomaly_count": anomaly_count,
+                "anomaly_percentage": (
+                    anomaly_count / len(df) * 100 if len(df) else 0
+                )
+            }
         )
     except Exception:
         insights = []
@@ -2186,75 +2192,219 @@ def show_ml_anomalies():
 # SMART INSIGHTS
 # ============================================================
 
-def show_smart_insights():
+def get_comparison_snapshot(df):
+    """Calculate comparable quality metrics without changing the dataframe."""
+    if df is None:
+        return None
 
+    context_result = detect_context(df)
+    if isinstance(context_result, dict):
+        context_name = (
+            context_result.get("context")
+            or context_result.get("detected_context")
+            or "General"
+        )
+    else:
+        context_name = context_result or "General"
+
+    context_aliases = {
+        "academic": "Academic",
+        "sales": "Sales",
+        "hr": "HR",
+        "human resources": "HR",
+        "healthcare": "Healthcare",
+        "general": "General"
+    }
+    context_name = context_aliases.get(
+        str(context_name).strip().lower(),
+        str(context_name).strip()
+    )
+
+    snapshot_issues = run_quality_checks(df, context_name)
+    snapshot_score = calculate_quality_score(df, snapshot_issues)
+
+    return {
+        "rows": int(len(df)),
+        "columns": int(len(df.columns)),
+        "missing": int(df.isna().sum().sum()),
+        "duplicates": int(df.duplicated().sum()),
+        "issues": len(snapshot_issues),
+        "score": float(snapshot_score)
+    }
+
+
+def show_smart_insights():
     st.markdown(
         '<div class="page-title">Smart Insights</div>',
         unsafe_allow_html=True
     )
-
     st.markdown(
         '<div class="page-subtitle">'
-        'Human-readable observations generated from the analysis results.'
+        'Interpret the findings and track the impact of cleaning actions.'
         '</div>',
         unsafe_allow_html=True
     )
 
     if st.session_state.df is None:
-
         st.info("Upload a dataset first.")
         return
 
-    insights = st.session_state.insights
+    current_df = st.session_state.df.copy()
+    original_df = st.session_state.get("original_df")
+    issues = st.session_state.get("issues", [])
+    anomaly_count = int(st.session_state.get("anomaly_count", 0) or 0)
+    row_count = len(current_df)
+    column_count = len(current_df.columns)
+    missing_count = int(current_df.isna().sum().sum())
+    duplicate_count = int(current_df.duplicated().sum())
+    high_priority_count = sum(
+        1 for issue in issues
+        if get_issue_severity(issue) in ("Critical", "High")
+    )
 
-    if not insights:
+    # Interpret the results instead of repeating raw issue/anomaly tables.
+    insights = []
+    context_name = get_context_name()
+    confidence = get_context_confidence()
+    if context_name and context_name != "Not detected":
+        insights.append((
+            "Dataset context",
+            f"QualiSight classified this dataset as {context_name} with "
+            f"{confidence * 100:.1f}% confidence. Treat this classification as guidance, "
+            "not proof that every column has been interpreted correctly."
+        ))
 
-        st.info(
-            "No additional insights were generated."
-        )
-        return
+    if missing_count:
+        insights.append((
+            "Completeness needs attention",
+            f"There are {missing_count:,} missing cell(s) in the current dataset. "
+            "Choose a treatment column by column; mean or median filling is suitable only "
+            "when it makes sense for that field."
+        ))
+    else:
+        insights.append((
+            "No missing cells detected",
+            "The current dataset has no missing cells. This supports completeness, "
+            "but does not by itself confirm that values are accurate or valid."
+        ))
 
-    for index, insight in enumerate(insights, start=1):
+    if duplicate_count:
+        insights.append((
+            "Check repeated records",
+            f"{duplicate_count:,} completely duplicated row(s) remain. Review whether "
+            "they represent accidental repeats before removing them."
+        ))
+    else:
+        insights.append((
+            "No exact duplicate rows",
+            "No completely duplicated rows were found. Similar records or duplicate IDs "
+            "may still need separate checks."
+        ))
 
+    if high_priority_count:
+        insights.append((
+            "Prioritize higher-severity findings",
+            f"{high_priority_count} detected issue(s) are marked High or Critical. "
+            "Review these first because they may have a greater effect on downstream analysis."
+        ))
+    elif issues:
+        insights.append((
+            "Review findings before analysis",
+            f"QualiSight currently reports {len(issues)} rule-based issue(s), with none "
+            "marked High or Critical. Lower severity does not necessarily mean an issue "
+            "is irrelevant to your use case."
+        ))
+    else:
+        insights.append((
+            "No rule-based issues reported",
+            "The current rules did not report any issues. This does not prove the dataset "
+            "is error-free; results depend on the checks available for the detected context."
+        ))
+
+    if anomaly_count:
+        anomaly_pct = (anomaly_count / row_count * 100) if row_count else 0
+        insights.append((
+            "Investigate unusual records",
+            f"Isolation Forest flagged {anomaly_count:,} potential anomalous record(s) "
+            f"({anomaly_pct:.2f}% of rows). These are statistically unusual, not automatically "
+            "incorrect; inspect them before changing or removing them."
+        ))
+    else:
+        insights.append((
+            "No potential ML anomalies reported",
+            "The current anomaly detector did not flag records. This is not a guarantee "
+            "that every value follows the expected business rules."
+        ))
+
+    if row_count == 0 or column_count == 0:
+        readiness = "The dataset has no usable rows or columns, so analysis should wait until valid data is available."
+    elif missing_count or duplicate_count or high_priority_count:
+        readiness = "The dataset can be explored, but review outstanding completeness, duplication, or higher-severity findings before drawing conclusions."
+    else:
+        readiness = "The current checks show no missing cells, exact duplicates, or high-priority rule findings. Review domain validity and potential anomalies before treating the dataset as analysis-ready."
+    insights.append(("Analysis readiness", readiness))
+
+    st.markdown(
+        '<div class="section-card"><div class="section-title">What the results mean</div>'
+        '<div class="section-subtitle">Observations generated from the current dataset and analysis.</div></div>',
+        unsafe_allow_html=True
+    )
+    for index, (heading, message) in enumerate(insights, start=1):
         st.markdown(
             clean_html(f"""
             <div class="section-card">
-
-                <div style="
-                    display:flex;
-                    gap:14px;
-                    align-items:flex-start;
-                ">
-
-                    <div style="
-                        width:35px;
-                        height:35px;
-                        min-width:35px;
-                        border-radius:50%;
-                        background:#e4f2ff;
-                        color:#0874e5;
-                        display:flex;
-                        align-items:center;
-                        justify-content:center;
-                        font-weight:800;
-                    ">
+                <div style="display:flex;gap:14px;align-items:flex-start;">
+                    <div style="width:35px;height:35px;min-width:35px;border-radius:50%;
+                                background:#e4f2ff;color:#0874e5;display:flex;
+                                align-items:center;justify-content:center;font-weight:800;">
                         {index}
                     </div>
-
-                    <div style="
-                        color:#345a88;
-                        font-size:14px;
-                        line-height:1.6;
-                    ">
-                        {insight}
+                    <div style="color:#345a88;font-size:14px;line-height:1.6;">
+                        <div style="font-weight:700;color:#173a70;margin-bottom:4px;">{heading}</div>
+                        {message}
                     </div>
-
                 </div>
-
             </div>
             """),
             unsafe_allow_html=True
         )
+
+    # Before/after metrics use the same rule engine and scoring function.
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-card"><div class="section-title">Before vs After Comparison</div>'
+        '<div class="section-subtitle">The uploaded dataset is compared with the current version after cleaning actions.</div></div>',
+        unsafe_allow_html=True
+    )
+
+    if original_df is None:
+        st.info("The original dataset snapshot is unavailable. Re-upload the dataset to enable this comparison.")
+        return
+
+    before = get_comparison_snapshot(original_df)
+    after = get_comparison_snapshot(current_df)
+    if before is None or after is None:
+        st.info("Comparison metrics could not be calculated for this dataset.")
+        return
+
+    score_change = after["score"] - before["score"]
+    if score_change > 0:
+        st.success(f"Quality score increased by {score_change:.2f} points after the applied changes.")
+    elif score_change < 0:
+        st.warning(f"Quality score decreased by {abs(score_change):.2f} points. Review the changes and their effect on your data.")
+    else:
+        st.info("The quality score did not change after the applied changes.")
+
+    comparison_rows = [
+        {"Metric": "Quality score", "Before cleaning": f'{before["score"]:.2f}/100', "Current dataset": f'{after["score"]:.2f}/100', "Change": f'{score_change:+.2f} points'},
+        {"Metric": "Rows", "Before cleaning": before["rows"], "Current dataset": after["rows"], "Change": f'{after["rows"] - before["rows"]:+,}'},
+        {"Metric": "Columns", "Before cleaning": before["columns"], "Current dataset": after["columns"], "Change": f'{after["columns"] - before["columns"]:+,}'},
+        {"Metric": "Missing cells", "Before cleaning": before["missing"], "Current dataset": after["missing"], "Change": f'{after["missing"] - before["missing"]:+,}'},
+        {"Metric": "Exact duplicate rows", "Before cleaning": before["duplicates"], "Current dataset": after["duplicates"], "Change": f'{after["duplicates"] - before["duplicates"]:+,}'},
+        {"Metric": "Rule-based issues", "Before cleaning": before["issues"], "Current dataset": after["issues"], "Change": f'{after["issues"] - before["issues"]:+,}'}
+    ]
+    st.dataframe(pd.DataFrame(comparison_rows), use_container_width=True, hide_index=True)
+    st.caption("A lower issue count or higher score is not a substitute for validating whether the cleaned values are appropriate for your dataset.")
 
 
 # ============================================================
@@ -2339,17 +2489,40 @@ def show_fix_data():
             key="apply_missing"
         ):
 
-            st.session_state.df = fill_missing_values(
+            # The UI uses lowercase labels, while remediation.py expects
+            # title-case method names. Map them before calling the function.
+            method_map = {
+                "median": "Median",
+                "mean": "Mean",
+                "mode": "Mode",
+                "forward_fill": "Forward Fill",
+            }
+            method_for_cleaning = method_map.get(method, method)
+
+            before_missing = int(st.session_state.df.isna().sum().sum())
+            cleaned_df = fill_missing_values(
                 st.session_state.df,
                 selected_column,
-                method
+                method_for_cleaning
             )
+            after_missing = int(cleaned_df.isna().sum().sum())
+            st.session_state.df = cleaned_df
 
             rerun_analysis()
 
-            st.success(
-                "Missing value treatment applied."
-            )
+            if after_missing < before_missing:
+                st.success(
+                    f"Treatment applied to '{selected_column}'. Missing cells decreased "
+                    f"from {before_missing:,} to {after_missing:,}."
+                )
+            elif before_missing == 0:
+                st.info("No missing cells were available to fill.")
+            else:
+                st.warning(
+                    f"Missing cells remain at {after_missing:,}. This method may not "
+                    "apply to this column's data type, or the selected column may not "
+                    "have values that can be filled by this method."
+                )
 
             st.rerun()
 
